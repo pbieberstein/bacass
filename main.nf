@@ -109,7 +109,7 @@ if (params.reads) {
 } else if (params.readPaths) {
    Channel.from( params.readPaths )
 	.map { row -> [ row[0], [file(row[1][0]), file(row[1][1])]] }
-    .dump()
+    .dump() .ifEmpty { error "Oops! Cannot find any file matching: ${params.reads}"  }
     .set { fastq_ch }
 
 } else {
@@ -119,12 +119,19 @@ if (params.reads) {
         .set { fastq_ch }
 }
 
+
+// If there are long reads specified, put them in all the channels for purity check (kraken), assembly (unicycler), quality control (fastqc)
+if (params.longReads) {
+    Channel.fromPath( params.longReads )
+    .into { long_kraken2_ch;long_unicycler_ch;long_fastqc_ch }
+}
+
 // Header log info
 log.info nfcoreHeader()
 def summary = [:]
 if(workflow.revision) summary['Pipeline Release'] = workflow.revision
 summary['Pipeline Name']  = 'nf-core/bacass'
-summary['Run Name']         = custom_runName ?: workflow.runName
+summary['Run Name'] = custom_runName ?: workflow.runName
 
 //summary['Sample keys'] = sample_keys
 summary['Skip Kraken2'] = params.skip_kraken2
@@ -242,14 +249,16 @@ process fastqc {
     publishDir "${params.outdir}/${sample_id}/${sample_id}_reads", mode: 'copy'
 
     input:
+    // should include the long reads into this channel.
     set sample_id, file(fq1), file(fq2) from fastqc_ch
+    file long_fq from long_fastqc_ch
 
     output:
     file "*_fastqc.{zip,html}" into fastqc_results
 
     script:
     """
-    fastqc -t {task.cpus} -q ${fq1} ${fq2}
+    fastqc -t {task.cpus} -q ${fq1} ${fq2} ${long_fq}
     """
 }
 
@@ -257,12 +266,16 @@ process fastqc {
 /* unicycler
  */
 process unicycler {
-    label 'large'
+    label 'medium'
     tag "$sample_id"
     publishDir "${params.outdir}/${sample_id}/", mode: 'copy'
+    cpus 3
+    memory '10 GB'
+
 
     input:
-    set sample_id, file(fq1), file(fq2) from unicycler_ch
+    set sample_id, file(fq1), file(fq2) from unicycler_ch 
+    file long_fq from long_unicycler_ch // included long reads here
 
     output:
     set sample_id, file("${sample_id}_assembly.fasta") into quast_ch, prokka_ch
@@ -273,7 +286,7 @@ process unicycler {
     
     script:
     """
-    unicycler -1 $fq1 -2 $fq2 --threads ${task.cpus} ${params.unicycler_args} --keep 0 -o .
+    unicycler -1 $fq1 -2 $fq2 -l $long_fq --threads ${task.cpus} ${params.unicycler_args} --keep 0 -o .
     mv unicycler.log ${sample_id}_unicycler.log
     # rename so that quast can use the name 
     mv assembly.gfa ${sample_id}_assembly.gfa
@@ -286,12 +299,13 @@ process unicycler {
  */
 if(!params.skip_kraken2) {
     process kraken2 {
-        label 'large'
+        label 'medium'
         tag "$sample_id"
         publishDir "${params.outdir}/${sample_id}/", mode: 'copy'
 
         input:
         set sample_id, file(fq1), file(fq2) from kraken2_ch
+        file long_fq from long_kraken2_ch
 
         output:
         file("${sample_id}_kraken2.report")
@@ -332,9 +346,11 @@ process quast {
 /* annotation with prokka
  */
 process prokka {
-   label 'large'
+   label 'medium'
    tag "$sample_id"
    publishDir "${params.outdir}/${sample_id}/", mode: 'copy'
+   cpus 3
+    memory '10 GB'
 
    input:
    set sample_id, fasta from prokka_ch
